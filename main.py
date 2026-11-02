@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QHBoxLayout,
     QMessageBox,
+    QComboBox,
 )
 
 from PySide6.QtGui import QImage, QPixmap
@@ -31,11 +32,30 @@ class MainWindow(QMainWindow):
         self.gentl_file = None
         self.camera_worker = None
 
-        # Main layout
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
 
         main_layout = QVBoxLayout(central_widget)
+
+        # Camera source selector
+        main_layout.addWidget(QLabel("Select Camera Source:"))
+
+        self.camera_selector = QComboBox()
+        self.camera_selector.addItem("Laptop Webcam", "webcam")
+        self.camera_selector.addItem(
+            "CMV-12K Industrial Camera (GenTL)", "gentl"
+        )
+
+        main_layout.addWidget(self.camera_selector)
+
+        # GenTL file selection
+        self.file_label = QLabel("GenTL producer: Not selected")
+
+        self.select_button = QPushButton("Select GenTL Producer")
+        self.select_button.clicked.connect(self.select_gentl_file)
+
+        main_layout.addWidget(self.file_label)
+        main_layout.addWidget(self.select_button)
 
         # Camera preview
         self.preview = QLabel("Camera preview will appear here")
@@ -47,15 +67,7 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(self.preview)
 
-        # File selection
-        self.file_label = QLabel("GenTL producer: Not selected")
-        main_layout.addWidget(self.file_label)
-
-        self.select_button = QPushButton("Select GenTL Producer")
-        self.select_button.clicked.connect(self.select_gentl_file)
-        main_layout.addWidget(self.select_button)
-
-        # Camera controls
+        # Start and stop buttons
         button_layout = QHBoxLayout()
 
         self.start_button = QPushButton("Start Camera")
@@ -78,9 +90,10 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.fps_label)
 
     def select_gentl_file(self):
+
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Select GenTL Producer File",
+            "Select GenTL Producer",
             "",
             "GenTL files (*.cti *.dll);;All files (*)"
         )
@@ -93,7 +106,9 @@ class MainWindow(QMainWindow):
 
     def start_camera(self):
 
-        if not self.gentl_file:
+        camera_type = self.camera_selector.currentData()
+
+        if camera_type == "gentl" and not self.gentl_file:
             QMessageBox.warning(
                 self,
                 "GenTL File Required",
@@ -104,16 +119,22 @@ class MainWindow(QMainWindow):
         if self.camera_worker and self.camera_worker.isRunning():
             return
 
-        self.camera_worker = CameraWorker(self.gentl_file)
+        self.preview.setText("Connecting to camera...")
+
+        self.camera_worker = CameraWorker(
+            camera_type=camera_type,
+            gentl_file=self.gentl_file
+        )
 
         self.camera_worker.frame_ready.connect(self.display_frame)
         self.camera_worker.status_changed.connect(self.update_status)
         self.camera_worker.error_occurred.connect(self.show_camera_error)
         self.camera_worker.fps_updated.connect(self.update_fps)
-
         self.camera_worker.finished.connect(self.camera_finished)
 
         self.start_button.setEnabled(False)
+        self.camera_selector.setEnabled(False)
+        self.select_button.setEnabled(False)
         self.stop_button.setEnabled(True)
 
         self.camera_worker.start()
@@ -134,6 +155,7 @@ class MainWindow(QMainWindow):
 
         if frame.ndim == 2:
             height, width = frame.shape
+
             image = QImage(
                 frame.data,
                 width,
@@ -144,22 +166,13 @@ class MainWindow(QMainWindow):
 
         elif frame.ndim == 3 and frame.shape[2] == 3:
             height, width, _ = frame.shape
+
             image = QImage(
                 frame.data,
                 width,
                 height,
                 frame.strides[0],
                 QImage.Format.Format_BGR888
-            )
-
-        elif frame.ndim == 3 and frame.shape[2] == 4:
-            height, width, _ = frame.shape
-            image = QImage(
-                frame.data,
-                width,
-                height,
-                frame.strides[0],
-                QImage.Format.Format_RGBA8888
             )
 
         else:
@@ -183,6 +196,7 @@ class MainWindow(QMainWindow):
 
     def show_camera_error(self, error):
         self.status_label.setText("Status: Camera error")
+
         QMessageBox.critical(
             self,
             "Camera Error",
@@ -190,11 +204,15 @@ class MainWindow(QMainWindow):
         )
 
     def camera_finished(self):
+
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
+        self.camera_selector.setEnabled(True)
+        self.select_button.setEnabled(True)
         self.fps_label.setText("FPS: 0.0")
 
     def closeEvent(self, event):
+
         if self.camera_worker and self.camera_worker.isRunning():
             self.camera_worker.stop()
 
@@ -202,6 +220,7 @@ class MainWindow(QMainWindow):
 
 
 if __name__ == "__main__":
+
     app = QApplication(sys.argv)
 
     window = MainWindow()
