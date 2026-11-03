@@ -1,6 +1,9 @@
-
 numpy
 opencv-python
 PySide6
 harvesters==1.4.0
 genicam==1.2.0
+ultralytics
+transformers
+accelerate
+safetensors
