@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+models/
+output/
+third_party/
+video1.mp4
+yolov8n.pt
+*.jpg
