@@ -1,463 +1,254 @@
+"""
+Live YOLOv8 + official Meta SAM2.1 pipeline.
+
+Per frame:
+  1. SAM2 tracks every existing object (persistent memory, no window replay).
+  2. YOLO runs every `yolo_interval` frames, and also immediately when an
+     object's mask is empty or a new-object candidate is pending.
+  3. Detections are matched to existing objects by mask pixels; unmatched
+     detections must persist for NEW_PERSIST consecutive YOLO runs before
+     they get a new, never-recycled ID and are seeded into SAM2.
+
+process_frame() takes one BGR frame, so it can be driven from any thread.
+"""
 
 import time
 
 import cv2
 import numpy as np
 import torch
-
 from ultralytics import YOLO
-from transformers import Sam2VideoModel, Sam2VideoProcessor
 
 from processing.device_manager import DeviceManager
+from processing.id_manager import IdManager, mask_to_box
+from processing.sam2_stream import SAM2StreamTracker
+
+_PALETTE = [
+    (66, 135, 245), (60, 200, 90), (245, 170, 50),
+    (200, 80, 220), (60, 210, 230), (240, 90, 90),
+]
 
 
 class LiveTrackingPipeline:
-    """
-    Live YOLOv8 + SAM2.1 streaming pipeline.
-
-    Input:
-        One OpenCV BGR frame at a time.
-
-    Output:
-        SAM2 masks, persistent object IDs, bounding boxes and FPS.
-    """
 
     def __init__(
         self,
         yolo_weights,
-        sam2_checkpoint=None,
-        sam2_config=None,
+        sam2_checkpoint,
+        sam2_config,
         device_mode="auto",
-        detection_confidence=0.10,
-        new_object_confidence=0.25,
-        max_objects=6,
+        yolo_interval=5,
+        detect_conf=0.10,
+        yolo_imgsz=640,
+        new_conf=0.25,
+        new_persist=3,
         match_iou=0.30,
         chain_iou=0.30,
-        new_persistence=3,
-        sam2_model_id="facebook/sam2.1-hiera-small",
-        image_size=640,
+        max_objects=6,
+        exclude_zone=(0.75, 0.88, 1.0, 1.0),
+        infer_max_side=1280,
+        vos_optimized=False,
+        precision="auto",
     ):
         self.device_manager = DeviceManager(device_mode)
         self.device = self.device_manager.get_device()
 
         self.yolo_weights = yolo_weights
+        self.sam2_checkpoint = sam2_checkpoint
+        self.sam2_config = sam2_config
+        self.vos_optimized = vos_optimized
+        self.precision = precision
 
-        # Transformers uses its own model format.
-        # A Meta SAM2 .pt checkpoint cannot be loaded directly here.
-        if sam2_checkpoint and str(sam2_checkpoint).lower().endswith(".pt"):
-            raise ValueError(
-                "The old Meta SAM2 .pt checkpoint is not directly "
-                "compatible with the Transformers implementation. "
-                "Use a Hugging Face SAM2 model ID or local model folder."
-            )
+        self.yolo_interval = max(1, int(yolo_interval))
+        self.detect_conf = detect_conf
+        self.yolo_imgsz = yolo_imgsz
+        self.exclude_zone = exclude_zone
+        self.infer_max_side = infer_max_side
 
-        self.sam2_model_id = sam2_checkpoint or sam2_model_id
-
-        self.detection_confidence = detection_confidence
-        self.new_object_confidence = new_object_confidence
-        self.max_objects = max_objects
-        self.match_iou = match_iou
-        self.chain_iou = chain_iou
-        self.new_persistence = new_persistence
-        self.image_size = image_size
+        self.ids = IdManager(
+            match_iou=match_iou,
+            chain_iou=chain_iou,
+            new_conf=new_conf,
+            new_persist=new_persist,
+            max_objects=max_objects,
+        )
 
         self.yolo = None
-        self.sam2_model = None
-        self.sam2_processor = None
-        self.sam2_session = None
-
-        self.tracking_started = False
-        self.frame_index = 0
-
-        self.object_ids = {}
-        self.candidates = []
-        self.next_object_id = 1
-
-        self.current_fps = 0.0
-        self._last_process_time = None
+        self.tracker = None
+        self.frame_count = 0
 
         print("Selected device:", self.device_manager.device_name)
 
+    # ------------------------------------------------------------------
     def load_models(self):
-        """Load YOLOv8 and the Hugging Face SAM2.1 model."""
-
         print("Loading YOLOv8...")
         self.yolo = YOLO(self.yolo_weights)
-        self.yolo.to(str(self.device))
-        print("YOLOv8 loaded.")
-
-        print("Loading SAM2.1:", self.sam2_model_id)
-
-        self.sam2_processor = Sam2VideoProcessor.from_pretrained(
-            self.sam2_model_id
+        print("Loading official SAM2.1...")
+        self.tracker = SAM2StreamTracker(
+            self.sam2_checkpoint,
+            self.sam2_config,
+            self.device,
+            vos_optimized=self.vos_optimized,
+            precision=self.precision,
+        )
+        print(
+            "Models loaded on", self.device_manager.device_name,
+            "| SAM2 precision:", self.tracker.precision,
         )
 
-        self.sam2_model = Sam2VideoModel.from_pretrained(
-            self.sam2_model_id
-        )
+    def reset(self):
+        """Start a fresh tracking session (IDs restart at 1)."""
+        if self.tracker is not None:
+            self.tracker.reset()
+        self.ids.reset()
+        self.frame_count = 0
 
-        self.sam2_model.to(self.device)
-        self.sam2_model.eval()
-
-        self._create_streaming_session()
-
-        print("SAM2.1 loaded.")
-        print("Inference device:", self.device_manager.device_name)
-
-    def _create_streaming_session(self):
-        """Create an empty SAM2 session for incoming camera frames."""
-
-        self.sam2_session = self.sam2_processor.init_video_session(
-            inference_device=str(self.device),
-            video_storage_device="cpu",
-        )
-
-    @staticmethod
-    def box_iou(box_a, box_b):
-        """Calculate intersection over union between two boxes."""
-
-        ax1, ay1, ax2, ay2 = box_a
-        bx1, by1, bx2, by2 = box_b
-
-        x1 = max(ax1, bx1)
-        y1 = max(ay1, by1)
-        x2 = min(ax2, bx2)
-        y2 = min(ay2, by2)
-
-        intersection = max(0, x2 - x1) * max(0, y2 - y1)
-
-        area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
-        area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
-
-        union = area_a + area_b - intersection
-
-        if union <= 0:
-            return 0.0
-
-        return intersection / union
-
-    @staticmethod
-    def mask_to_box(mask):
-        """Convert a binary segmentation mask into an XYXY box."""
-
-        ys, xs = np.where(mask > 0)
-
-        if len(xs) == 0:
-            return None
-
-        return (
-            float(xs.min()),
-            float(ys.min()),
-            float(xs.max() + 1),
-            float(ys.max() + 1),
-        )
+    # ------------------------------------------------------------------
+    def _downscale(self, frame):
+        h, w = frame.shape[:2]
+        longest = max(h, w)
+        if self.infer_max_side and longest > self.infer_max_side:
+            scale = self.infer_max_side / longest
+            frame = cv2.resize(
+                frame,
+                (int(round(w * scale)), int(round(h * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+        return frame
 
     def _run_yolo(self, frame):
-        """Run YOLO detection on the incoming frame."""
-
         results = self.yolo.predict(
             source=frame,
-            conf=self.detection_confidence,
-            imgsz=self.image_size,
+            conf=self.detect_conf,
+            imgsz=self.yolo_imgsz,
             device=str(self.device),
             verbose=False,
         )
 
         detections = []
-
         if not results or results[0].boxes is None:
             return detections
 
-        boxes = results[0].boxes
+        h, w = frame.shape[:2]
+        zx1, zy1, zx2, zy2 = self.exclude_zone
+        xyxy = results[0].boxes.xyxy.detach().cpu().numpy()
+        conf = results[0].boxes.conf.detach().cpu().numpy()
 
-        xyxy = boxes.xyxy.detach().cpu().numpy()
-        confidences = boxes.conf.detach().cpu().numpy()
+        for box, c in zip(xyxy, conf):
+            cx = (box[0] + box[2]) / 2 / w
+            cy = (box[1] + box[3]) / 2 / h
+            if zx1 <= cx <= zx2 and zy1 <= cy <= zy2:
+                continue  # excluded zone (e.g. overlay / watermark)
 
-        for box, confidence in zip(xyxy, confidences):
             detections.append({
                 "box": tuple(float(v) for v in box),
-                "confidence": float(confidence),
+                "confidence": float(c),
             })
 
         return detections
 
-    def _add_new_object(self, box, original_size):
-        """Give a confirmed new object a permanent ID and SAM2 prompt."""
-
-        if len(self.object_ids) >= self.max_objects:
-            return None
-
-        object_id = self.next_object_id
-        self.next_object_id += 1
-
-        x1, y1, x2, y2 = box
-
-        self.sam2_processor.add_inputs_to_inference_session(
-            inference_session=self.sam2_session,
-            frame_idx=self.frame_index,
-            obj_ids=object_id,
-            input_boxes=[[
-                [
-                    float(x1),
-                    float(y1),
-                    float(x2),
-                    float(y2),
-                ]
-            ]],
-            original_size=original_size,
-        )
-
-        self.object_ids[object_id] = {
-            "box": box,
-            "last_seen": self.frame_index,
-        }
-
-        print(
-            f"New object ID {object_id} "
-            f"seeded at frame {self.frame_index}"
-        )
-
-        return object_id
-
-    def _update_new_object_candidates(
-        self,
-        detections,
-        original_size,
-    ):
-        """
-        Confirm new objects over multiple consecutive frames.
-
-        Existing SAM2 objects are matched first.
-        Unmatched detections must persist before receiving a new ID.
-        """
-
-        used_object_ids = set()
-        used_candidates = set()
-
-        for detection in detections:
-            box = detection["box"]
-            confidence = detection["confidence"]
-
-            if confidence < self.new_object_confidence:
-                continue
-
-            # Check whether this detection belongs to an existing ID.
-            matched_existing = False
-
-            for object_id, state in self.object_ids.items():
-                if object_id in used_object_ids:
-                    continue
-
-                overlap = self.box_iou(box, state["box"])
-
-                if overlap >= self.match_iou:
-                    used_object_ids.add(object_id)
-                    matched_existing = True
-                    break
-
-            if matched_existing:
-                continue
-
-            # Look for a matching candidate from the previous frame.
-            best_index = None
-            best_iou = 0.0
-
-            for index, candidate in enumerate(self.candidates):
-                if index in used_candidates:
-                    continue
-
-                if candidate["last_frame"] != self.frame_index - 1:
-                    continue
-
-                overlap = self.box_iou(box, candidate["box"])
-
-                if overlap >= self.chain_iou and overlap > best_iou:
-                    best_iou = overlap
-                    best_index = index
-
-            if best_index is None:
-                self.candidates.append({
-                    "box": box,
-                    "hits": 1,
-                    "last_frame": self.frame_index,
-                })
-                used_candidates.add(len(self.candidates) - 1)
-
-            else:
-                candidate = self.candidates[best_index]
-
-                candidate["box"] = box
-                candidate["hits"] += 1
-                candidate["last_frame"] = self.frame_index
-
-                used_candidates.add(best_index)
-
-                if candidate["hits"] >= self.new_persistence:
-                    self._add_new_object(box, original_size)
-
-                    candidate["hits"] = 0
-
-        # Remove candidates that were not observed in the latest frame.
-        self.candidates = [
-            candidate
-            for candidate in self.candidates
-            if candidate["last_frame"] == self.frame_index
-            and candidate["hits"] > 0
-        ]
-
-    def process_frame(self, frame):
-        """
-        Process one live camera frame.
-
-        Returns a dictionary containing:
-            frame
-            masks
-            boxes
-            detections
-            fps
-            frame_index
-        """
-
-        if self.yolo is None or self.sam2_model is None:
-            raise RuntimeError("Load the models before processing frames.")
-
-        if frame is None or not isinstance(frame, np.ndarray):
-            raise ValueError("Invalid camera frame.")
-
-        if frame.ndim != 3 or frame.shape[2] != 3:
+    # ------------------------------------------------------------------
+    def process_frame(self, frame, capture_ts=None):
+        if self.yolo is None or self.tracker is None:
+            raise RuntimeError("Call load_models() first.")
+        if (
+            not isinstance(frame, np.ndarray)
+            or frame.ndim != 3
+            or frame.shape[2] != 3
+        ):
             raise ValueError("Expected a 3-channel BGR image.")
 
-        start_time = time.perf_counter()
+        t_start = time.perf_counter()
+        frame = self._downscale(frame)
 
-        height, width = frame.shape[:2]
+        # 1) SAM2 updates all existing objects.
+        t0 = time.perf_counter()
+        masks = self.tracker.track(frame)
+        sam_ms = (time.perf_counter() - t0) * 1000.0
 
-        # Convert OpenCV BGR into RGB for SAM2.
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        self.ids.note_masks(masks)
 
-        inputs = self.sam2_processor(
-            images=rgb_frame,
-            return_tensors="pt",
+        # 2) Periodic / triggered YOLO.
+        run_yolo = (
+            self.frame_count % self.yolo_interval == 0
+            or self.ids.needs_detection()
         )
 
-        pixel_values = inputs.pixel_values[0].to(self.device)
+        detections, new_ids, yolo_ms = [], [], 0.0
 
-        original_size = tuple(
-            int(value) for value in inputs.original_sizes[0]
-        )
-
-        # Detect objects and identify new-object candidates.
-        with torch.inference_mode():
+        if run_yolo:
+            t0 = time.perf_counter()
             detections = self._run_yolo(frame)
+            yolo_ms = (time.perf_counter() - t0) * 1000.0
 
-            self._update_new_object_candidates(
-                detections,
-                original_size,
-            )
+            new_objects = self.ids.update(detections, masks)
 
-            # Process this frame using the persistent SAM2 session.
-            outputs = self.sam2_model(
-                inference_session=self.sam2_session,
-                frame=pixel_values,
-            )
+            # 3) Add confirmed new objects without replaying anything.
+            if new_objects:
+                t0 = time.perf_counter()
+                masks.update(self.tracker.seed(new_objects))
+                sam_ms += (time.perf_counter() - t0) * 1000.0
+                new_ids = [obj_id for obj_id, _ in new_objects]
 
-        masks_by_id = {}
-        boxes_by_id = {}
-
-        if outputs.pred_masks is not None:
-            processed_masks = self.sam2_processor.post_process_masks(
-                [outputs.pred_masks],
-                original_sizes=inputs.original_sizes,
-                binarize=True,
-            )[0]
-
-            processed_masks = processed_masks.detach().cpu().numpy()
-
-            output_ids = getattr(outputs, "object_ids", None)
-
-            if output_ids is None:
-                output_ids = self.sam2_session.obj_ids
-
-            output_ids = [int(value) for value in output_ids]
-
-            for index, object_id in enumerate(output_ids):
-                if index >= len(processed_masks):
-                    break
-
-                mask = np.squeeze(processed_masks[index]).astype(
-                    np.uint8
-                )
-
-                if mask.ndim != 2:
-                    continue
-
-                box = self.mask_to_box(mask)
-
-                masks_by_id[object_id] = mask
-
-                if box is not None:
-                    boxes_by_id[object_id] = box
-
-                    if object_id in self.object_ids:
-                        self.object_ids[object_id]["box"] = box
-                        self.object_ids[object_id]["last_seen"] = (
-                            self.frame_index
-                        )
-
-        elapsed = time.perf_counter() - start_time
-
-        instantaneous_fps = 1.0 / max(elapsed, 1e-9)
-
-        if self._last_process_time is None:
-            self.current_fps = instantaneous_fps
-        else:
-            self.current_fps = (
-                0.8 * self.current_fps
-                + 0.2 * instantaneous_fps
-            )
-
-        self._last_process_time = time.perf_counter()
+        boxes = {}
+        for obj_id, mask in masks.items():
+            box = mask_to_box(mask)
+            if box is not None:
+                boxes[obj_id] = box
 
         result = {
-            "frame": frame,
-            "masks": masks_by_id,
-            "boxes": boxes_by_id,
+            "frame": frame,                 # (possibly downscaled) frame the masks align to
+            "masks": masks,
+            "boxes": boxes,
             "detections": detections,
-            "fps": self.current_fps,
-            "frame_index": self.frame_index,
+            "frame_index": self.frame_count,
+            "capture_ts": capture_ts,
+            "yolo_ran": run_yolo,
+            "new_ids": new_ids,
+            "active_ids": list(self.ids.active),
+            "lost_ids": [i for i, n in self.ids.lost.items() if n > 0],
+            "yolo_ms": yolo_ms,
+            "sam_ms": sam_ms,
+            "total_ms": (time.perf_counter() - t_start) * 1000.0,
         }
 
-        self.frame_index += 1
-        self.tracking_started = len(self.object_ids) > 0
-
+        self.frame_count += 1
         return result
 
-    def reset(self):
-        """Reset tracking and start a fresh streaming session."""
-
-        if self.sam2_session is not None:
-            self.sam2_session.reset_inference_session()
-
-        self._create_streaming_session()
-
-        self.frame_index = 0
-        self.object_ids.clear()
-        self.candidates.clear()
-
-        self.next_object_id = 1
-        self.tracking_started = False
-        self.current_fps = 0.0
-        self._last_process_time = None
-
+    # ------------------------------------------------------------------
     def get_status(self):
         return {
-            "models_loaded": (
-                self.yolo is not None
-                and self.sam2_model is not None
-            ),
-            "tracking_started": self.tracking_started,
+            "models_loaded": self.yolo is not None and self.tracker is not None,
             "device": self.device_manager.get_status(),
-            "next_object_id": self.next_object_id,
-            "tracked_objects": len(self.object_ids),
-            "frame_index": self.frame_index,
-            "fps": self.current_fps,
+            "active_ids": list(self.ids.active),
+            "next_id": self.ids.next_id,
+            "frames_processed": self.frame_count,
         }
+
+
+def draw_result(result, hud_lines=()):
+    """Return a new BGR image with masks, boxes, IDs and HUD text drawn."""
+    out = result["frame"].copy()
+
+    for obj_id, mask in result["masks"].items():
+        color = _PALETTE[(obj_id - 1) % len(_PALETTE)]
+        m = mask.astype(bool)
+        if m.any():
+            out[m] = (0.5 * out[m] + 0.5 * np.array(color)).astype(np.uint8)
+
+    for obj_id, (x1, y1, x2, y2) in result["boxes"].items():
+        color = _PALETTE[(obj_id - 1) % len(_PALETTE)]
+        p1, p2 = (int(x1), int(y1)), (int(x2), int(y2))
+        cv2.rectangle(out, p1, p2, color, 2)
+        cv2.putText(
+            out, f"ID {obj_id}", (p1[0], max(18, p1[1] - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA,
+        )
+
+    for i, line in enumerate(hud_lines):
+        cv2.putText(
+            out, line, (10, 24 + 22 * i),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA,
+        )
+
+    return out
