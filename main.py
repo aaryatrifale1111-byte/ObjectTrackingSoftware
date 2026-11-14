@@ -23,20 +23,10 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtCore import Qt, QTimer
 
+from app_paths import YOLO_WEIGHTS, SAM2_CHECKPOINT, SAM2_CONFIG
 from camera.frame_buffer import FrameBuffer
 from camera.camera_worker import CameraWorker
 from processing.inference_worker import InferenceWorker
-
-
-def resource_path(relative):
-    """Works from source and (later) from a PyInstaller bundle."""
-    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, relative)
-
-
-YOLO_WEIGHTS = resource_path(os.path.join("models", "spark_yolov8n_best.pt"))
-SAM2_CHECKPOINT = resource_path(os.path.join("models", "sam2.1_hiera_small.pt"))
-SAM2_CONFIG = "configs/sam2.1/sam2.1_hiera_s.yaml"
 
 
 class MainWindow(QMainWindow):
@@ -417,6 +407,19 @@ class MainWindow(QMainWindow):
 
 
 if __name__ == "__main__":
+    import multiprocessing
+
+    multiprocessing.freeze_support()  # needed for PyInstaller on Windows
+
+    if "--selftest" in sys.argv:
+        # Headless check used to verify a packaged build: loads the models and
+        # runs a few frames, then exits. Optional argument: a video file.
+        import selftest
+
+        index = sys.argv.index("--selftest")
+        video = sys.argv[index + 1] if len(sys.argv) > index + 1 else None
+        sys.exit(selftest.run(video))
+
     app = QApplication(sys.argv)
 
     window = MainWindow()
